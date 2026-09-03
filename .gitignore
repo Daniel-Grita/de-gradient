@@ -1,0 +1,22 @@
+# OS
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# Editor
+.vscode/
+.idea/
+*.swp
+*~
+
+# The scratchpad Claude Code uses for headless-browser scripts lives outside
+# the repo, but guard against accidental drops in.
+scratchpad/
+
+# Per-machine Claude Code settings (permissions grants, keychain refs).
+.claude/settings.local.json
+
+# `.claude/skills/` is symlinks into `.agents/skills/` — the source-of-truth
+# directory. Commit the source, ignore the symlinks (they'd store as broken
+# text stubs on non-Windows and are trivially recreatable from `skills-lock.json`).
+.claude/skills/
