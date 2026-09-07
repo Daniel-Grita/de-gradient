@@ -312,19 +312,17 @@ body{
 .ctrl__head{display:flex;flex-direction:row;align-items:center;gap:var(--space-2)}
 .ctrl__label{flex:1;font-size:var(--text-label);font-weight:400;color:var(--color-text)}
 /* Shared base for the two inline editable value fields (.ctrl__value and
-   .swatch__hex). Both are transparent, borderless, right-aligned, tabular-num
-   inputs that carry a persistent underline so touch and non-hovering users
-   see the field IS editable. Focus turns the underline accent-ink. Bolding
-   on focus would reflow the digits inside a fixed width and make the value
-   jitter, so weight stays constant — only the seam colour changes. */
+   .swatch__hex). Transparent, borderless, right-aligned, tabular-num inputs.
+   No persistent underline at rest or on hover — Daniel found the chrome
+   noisy. The global :focus-visible rule already gives every focusable an
+   accent-ink outline, so keyboard users still see when a field is focused;
+   the affordance the underline used to carry has moved there. */
 .field{
   padding:0;text-align:right;flex-shrink:0;
   font-family:var(--font-numeric);letter-spacing:.02em;
-  background:transparent;border:0;border-bottom:1px solid var(--color-seam);
+  background:transparent;border:0;
   cursor:text;font-variant-numeric:tabular-nums;
 }
-.field:hover:not(:disabled){border-bottom-color:var(--color-legend-muted)}
-.field:focus-visible{border-bottom-color:var(--color-accent-ink);outline:none}
 
 /* Numeric readout in a control row — bold, ink, wider than the hex. */
 .ctrl__value{
