@@ -907,12 +907,112 @@ NOISE_SRC,
 "}"
 ].join("\n");
 
+/* Beads. Samples the same gradient at each cell centre, then paints a soft
+   annulus around it. Everything happens in one fragment shader — no cell
+   texture — because snoise is already evaluated per pixel and only the sample
+   position changes. Cell size is in pixels (uCellPx), so the bead pitch is
+   fixed in device pixels rather than in fraction of the frame, matching how a
+   real pegboard works. Softness, jitter and shading are all in half-cell
+   units so they read the same at any cell size. */
+var BEADS_FRAG_SRC = [
+"precision highp float;",
+"uniform vec2 uResolution;",
+"uniform float uPhase;",
+"uniform float uRadius;",
+"uniform float uDensity;",
+"uniform float uStrength;",
+"uniform float uBrightness;",
+"uniform vec3 uColor1;",
+"uniform vec3 uColor2;",
+"uniform vec3 uColor3;",
+"uniform float uColorCount;",
+"uniform float uDuotone;",
+"uniform vec3 uInk;",
+"uniform vec3 uPaper;",
+"uniform float uCellPx;",
+"uniform float uOuterR;",
+"uniform float uInnerR;",
+"uniform float uSoftness;",
+"uniform float uShading;",
+"uniform float uJitter;",
+"uniform vec3 uHoleColor;",
+NOISE_SRC,
+"",
+"float hash21(vec2 p){",
+"  return fract(sin(dot(p, vec2(127.1, 311.7))) * 43758.5453);",
+"}",
+"",
+"vec3 gradientColor(vec2 uv){",
+"  float ang = uPhase * 6.28318530718;",
+"  float cw = uRadius * cos(ang);",
+"  float sw = uRadius * sin(ang);",
+"  vec2 asp = uResolution / min(uResolution.x, uResolution.y);",
+"  vec4 p = vec4(uv * asp * uDensity * 3.0, cw, sw);",
+"  float n1 = snoise(p);",
+"  float n2 = snoise(vec4(p.xy * 2.13 + 31.7, p.zw * 1.7));",
+"  float n = n1 * 0.68 + n2 * 0.32;",
+"  n *= uStrength * 0.22;",
+"  float t1 = clamp(uv.x + n, 0.0, 1.0);",
+"  vec3 col = mix(uColor1, uColor2, smoothstep(0.0, 1.0, t1));",
+"  if (uColorCount > 2.5) {",
+"    float t2 = clamp(uv.y * 0.75 + n * 1.15 + 0.12, 0.0, 1.0);",
+"    col = mix(col, uColor3, smoothstep(0.0, 1.0, t2));",
+"  }",
+"  return col * uBrightness;",
+"}",
+"",
+"void main(){",
+"  vec2 fragCoord = gl_FragCoord.xy;",
+"  vec2 cellPos = fragCoord / uCellPx;",
+"  vec2 cellIdx = floor(cellPos);",
+"  vec2 cellCenter = (cellIdx + 0.5) * uCellPx;",
+"  vec2 cellCenterUV = cellCenter / uResolution;",
+"",
+// One colour per bead, sampled at the (un-jittered) cell centre. Sampling at
+// the jittered centre would smear the palette along with the physical offset,
+// which is not what a real pegboard does — the bead is placed on the grid, it
+// just sits a hair off.
+"  vec3 beadColor = gradientColor(cellCenterUV);",
+"  if (uDuotone > 0.5) {",
+"    float lum = dot(beadColor, vec3(0.2126, 0.7152, 0.0722));",
+"    beadColor = mix(uInk, uPaper, clamp(lum, 0.0, 1.0));",
+"  }",
+"",
+"  vec2 jHash = vec2(hash21(cellIdx + 1.7), hash21(cellIdx + 37.3)) - 0.5;",
+"  vec2 jitteredCenter = cellCenter + jHash * uJitter * uCellPx * 0.6;",
+"  vec2 delta = (fragCoord - jitteredCenter) / (uCellPx * 0.5);",
+"  float dist = length(delta);",
+"",
+"  float outerR = uOuterR;",
+"  float innerR = uInnerR * outerR;",
+"  float soft = max(uSoftness, 0.005);",
+"",
+"  float outerMask = 1.0 - smoothstep(outerR - soft, outerR + soft, dist);",
+"  float innerMask = smoothstep(innerR - soft, innerR + soft, dist);",
+"  float ring = outerMask * innerMask;",
+"",
+// Diagonal shading across the bead — light coming from the top-left. Not a
+// specular; just enough gradation to read as plastic rather than as a printed
+// dot. Fades to nothing at uShading = 0.
+"  float shade = 0.5 + 0.5 * dot(delta, vec2(-0.707, 0.707));",
+"  shade = clamp(shade, 0.0, 1.0);",
+"  vec3 shaded = beadColor * mix(0.7, 1.25, shade);",
+"  vec3 finalBead = mix(beadColor, shaded, uShading);",
+"",
+"  vec3 col = mix(uHoleColor, finalBead, ring);",
+"  gl_FragColor = vec4(clamp(col, 0.0, 1.0), 1.0);",
+"}"
+].join("\n");
+
 /* ============================================================================
-   WEBGL RENDERER (Gradient)
+   WEBGL RENDERER (Gradient + Beads)
    ============================================================================ */
 
 var GL = {
-  gl: null, program: null, buffer: null, loc: {}, ok: false, error: ""
+  gl: null,
+  program: null, loc: {},
+  programBeads: null, locBeads: {},
+  buffer: null, ok: false, error: ""
 };
 
 function compile(gl, type, src){
@@ -927,46 +1027,57 @@ function compile(gl, type, src){
   return sh;
 }
 
+/* Both programs share VERT_SRC, so their aPos attribute lands at the same
+   location; the vertex-attribute setup done once here works for either. */
+function linkProgram(gl, fragSrc, uniformNames){
+  var vs = compile(gl, gl.VERTEX_SHADER, VERT_SRC);
+  var fs = compile(gl, gl.FRAGMENT_SHADER, fragSrc);
+  var prog = gl.createProgram();
+  gl.attachShader(prog, vs);
+  gl.attachShader(prog, fs);
+  gl.linkProgram(prog);
+  if (!gl.getProgramParameter(prog, gl.LINK_STATUS)) {
+    throw new Error(gl.getProgramInfoLog(prog));
+  }
+  var loc = {};
+  for (var i = 0; i < uniformNames.length; i++) {
+    loc[uniformNames[i]] = gl.getUniformLocation(prog, uniformNames[i]);
+  }
+  return { program: prog, loc: loc };
+}
+
 function initGL(canvas){
   var gl = canvas.getContext("webgl", { preserveDrawingBuffer: true, antialias: false })
         || canvas.getContext("experimental-webgl", { preserveDrawingBuffer: true, antialias: false });
   if (!gl) { GL.error = "WebGL is not available in this browser."; return false; }
 
   try {
-    var vs = compile(gl, gl.VERTEX_SHADER, VERT_SRC);
-    var fs = compile(gl, gl.FRAGMENT_SHADER, FRAG_SRC);
-    var prog = gl.createProgram();
-    gl.attachShader(prog, vs);
-    gl.attachShader(prog, fs);
-    gl.linkProgram(prog);
-    if (!gl.getProgramParameter(prog, gl.LINK_STATUS)) {
-      throw new Error(gl.getProgramInfoLog(prog));
-    }
-    gl.useProgram(prog);
+    var grad = linkProgram(gl, FRAG_SRC, [
+      "uResolution","uPhase","uRadius","uDensity","uStrength","uBrightness",
+      "uGrain","uColor1","uColor2","uColor3","uColorCount"
+    ]);
+    var beads = linkProgram(gl, BEADS_FRAG_SRC, [
+      "uResolution","uPhase","uRadius","uDensity","uStrength","uBrightness",
+      "uColor1","uColor2","uColor3","uColorCount",
+      "uDuotone","uInk","uPaper",
+      "uCellPx","uOuterR","uInnerR","uSoftness","uShading","uJitter","uHoleColor"
+    ]);
+
+    gl.useProgram(grad.program);
 
     var buf = gl.createBuffer();
     gl.bindBuffer(gl.ARRAY_BUFFER, buf);
     gl.bufferData(gl.ARRAY_BUFFER, new Float32Array([-1,-1, 3,-1, -1,3]), gl.STATIC_DRAW);
-    var aPos = gl.getAttribLocation(prog, "aPos");
+    var aPos = gl.getAttribLocation(grad.program, "aPos");
     gl.enableVertexAttribArray(aPos);
     gl.vertexAttribPointer(aPos, 2, gl.FLOAT, false, 0, 0);
 
     GL.gl = gl;
-    GL.program = prog;
+    GL.program = grad.program;
+    GL.loc = grad.loc;
+    GL.programBeads = beads.program;
+    GL.locBeads = beads.loc;
     GL.buffer = buf;
-    GL.loc = {
-      uResolution: gl.getUniformLocation(prog, "uResolution"),
-      uPhase:      gl.getUniformLocation(prog, "uPhase"),
-      uRadius:     gl.getUniformLocation(prog, "uRadius"),
-      uDensity:    gl.getUniformLocation(prog, "uDensity"),
-      uStrength:   gl.getUniformLocation(prog, "uStrength"),
-      uBrightness: gl.getUniformLocation(prog, "uBrightness"),
-      uGrain:      gl.getUniformLocation(prog, "uGrain"),
-      uColor1:     gl.getUniformLocation(prog, "uColor1"),
-      uColor2:     gl.getUniformLocation(prog, "uColor2"),
-      uColor3:     gl.getUniformLocation(prog, "uColor3"),
-      uColorCount: gl.getUniformLocation(prog, "uColorCount")
-    };
     GL.ok = true;
     return true;
   } catch (e) {
@@ -1003,6 +1114,53 @@ function drawGradient(canvas, w, h, p, phase){
      saved localStorage entries predate the control and have no value at all —
      they mean three colours, which is what the app always did. */
   gl.uniform1f(GL.loc.uColorCount, Number(p.colors) === 2 ? 2 : 3);
+
+  gl.drawArrays(gl.TRIANGLES, 0, 3);
+}
+
+/* Beads. Same GL context as drawGradient — just a different program. cellSize
+   scales off the short edge the same way Dots's pixelSize does, so a bead
+   covers the same fraction of the frame at every ratio. */
+function drawGradientBeads(canvas, w, h, p, phase){
+  if (!GL.ok) return;
+  var gl = GL.gl;
+  if (canvas.width !== w || canvas.height !== h) {
+    canvas.width = w;
+    canvas.height = h;
+  }
+  gl.viewport(0, 0, w, h);
+  gl.useProgram(GL.programBeads);
+
+  var c1 = hexToRgb(p.color1);
+  var c2 = hexToRgb(p.color2);
+  var c3 = hexToRgb(p.color3);
+  var ink = hexToRgb(p.ink);
+  var paper = hexToRgb(p.paper);
+  var hole = hexToRgb(p.holeColor);
+
+  var cellPx = Math.max(2, Math.round(p.cellSize * (Math.min(w, h) / 680)));
+
+  var L = GL.locBeads;
+  gl.uniform2f(L.uResolution, w, h);
+  gl.uniform1f(L.uPhase, phase);
+  gl.uniform1f(L.uRadius, p.speed * 2.4);
+  gl.uniform1f(L.uDensity, p.density);
+  gl.uniform1f(L.uStrength, p.strength);
+  gl.uniform1f(L.uBrightness, p.brightness);
+  gl.uniform3f(L.uColor1, c1[0], c1[1], c1[2]);
+  gl.uniform3f(L.uColor2, c2[0], c2[1], c2[2]);
+  gl.uniform3f(L.uColor3, c3[0], c3[1], c3[2]);
+  gl.uniform1f(L.uColorCount, Number(p.colors) === 2 ? 2 : 3);
+  gl.uniform1f(L.uDuotone, p.colorMode === "duotone" ? 1 : 0);
+  gl.uniform3f(L.uInk, ink[0], ink[1], ink[2]);
+  gl.uniform3f(L.uPaper, paper[0], paper[1], paper[2]);
+  gl.uniform1f(L.uCellPx, cellPx);
+  gl.uniform1f(L.uOuterR, p.outer);
+  gl.uniform1f(L.uInnerR, p.inner);
+  gl.uniform1f(L.uSoftness, p.softness);
+  gl.uniform1f(L.uShading, p.shading);
+  gl.uniform1f(L.uJitter, p.jitter);
+  gl.uniform3f(L.uHoleColor, hole[0], hole[1], hole[2]);
 
   gl.drawArrays(gl.TRIANGLES, 0, 3);
 }
@@ -1701,6 +1859,75 @@ var EFFECTS = {
     }
   },
 
+  /* Same cell-sampling pipeline as Dots, but the mark is an annulus drawn at
+     full resolution in a second GL program. The bead's colour is the gradient
+     sampled at the (un-jittered) cell centre; the ring and shading are pure
+     SDF around that point. */
+  gbeads: {
+    id: "gbeads",
+    label: "Beads",
+    needsImage: false,
+    needsGL: true,
+    animated: true,
+    source: "gradient",
+    defaults: {
+      colors: "3",
+      color1: "#ff5005", color2: "#f5c76b", color3: "#ffe6cc",
+      speed: 0.35, loopDuration: 6.0,
+      strength: 3.50, density: 1.10, brightness: 1.15,
+      colorMode: "gradient",
+      ink: "#ff5005", paper: "#efebe0",
+      cellSize: 12, outer: 0.85, inner: 0.42,
+      softness: 0.06, shading: 0.45, jitter: 0.08,
+      holeColor: "#0a0a0a"
+    },
+    sections: [
+      { legend: "Beads", hint: "Cell size is the bead pitch; radius sets the outer edge; hole opens up the ring inside it.", controls: [
+        { type: "range", key: "cellSize", label: "Cell size", min: 4, max: 32, step: 1, dp: 0 },
+        { type: "range", key: "outer",    label: "Bead radius", min: 0.30, max: 1.00, step: 0.01, dp: 2 },
+        { type: "range", key: "inner",    label: "Hole radius", min: 0.00, max: 0.75, step: 0.01, dp: 2 },
+        { type: "range", key: "softness", label: "Softness",    min: 0.005, max: 0.30, step: 0.005, dp: 3 },
+        { type: "range", key: "shading",  label: "Shading",     min: 0.00, max: 1.00, step: 0.01, dp: 2 },
+        { type: "range", key: "jitter",   label: "Jitter",      min: 0.00, max: 0.50, step: 0.01, dp: 2 },
+        { type: "color", key: "holeColor", label: "Between beads" }
+      ]},
+      { legend: "Color", controls: [
+        { type: "select", key: "colorMode", label: "Color mode", options: [
+          { value: "gradient", label: "From gradient" },
+          { value: "duotone", label: "Ink & paper" }
+        ]},
+        { type: "color", key: "ink", label: "Ink" },
+        { type: "color", key: "paper", label: "Paper" },
+        { type: "select", key: "colors", label: "Colors", options: [
+          { value: "3", label: "3 colors" },
+          { value: "2", label: "2 colors" }
+        ]},
+        { type: "color", key: "color1", label: "Color 1" },
+        { type: "color", key: "color2", label: "Color 2" },
+        { type: "color", key: "color3", label: "Color 3",
+          activeWhen: { key: "colors", value: "3" } }
+      ]},
+      { legend: "Motion", controls: [
+        { type: "range", key: "speed", label: "Speed", min: 0.05, max: 1.5, step: 0.01, dp: 2 },
+        { type: "range", key: "loopDuration", label: "Loop duration", min: 2, max: 12, step: 0.5, dp: 1, suffix: "s" }
+      ]},
+      { legend: "Noise", hint: "Strength distorts the colour bands; density scales the pattern — larger cells, more of them.", controls: [
+        { type: "range", key: "strength", label: "Strength", min: 0, max: 8, step: 0.05, dp: 2 },
+        { type: "range", key: "density", label: "Density", min: 0.2, max: 3, step: 0.01, dp: 2 }
+      ]},
+      { legend: "Finish", controls: [
+        { type: "range", key: "brightness", label: "Brightness", min: 0.2, max: 2, step: 0.01, dp: 2 }
+      ]}
+    ],
+    presets: {
+      "Pegboard": { colors:"3", color1:"#ff5005", color2:"#f5c76b", color3:"#ffe6cc", speed:0.35, loopDuration:6.0, strength:3.50, density:1.10, brightness:1.15, colorMode:"gradient", ink:"#ff5005", paper:"#efebe0", cellSize:12, outer:0.85, inner:0.42, softness:0.06, shading:0.45, jitter:0.08, holeColor:"#0a0a0a" },
+      "Perler":   { colors:"3", color1:"#ff5005", color2:"#ffb347", color3:"#ffe0b3", speed:0.28, loopDuration:8.0, strength:4.20, density:0.95, brightness:1.20, colorMode:"gradient", ink:"#ff5005", paper:"#efebe0", cellSize:10, outer:0.90, inner:0.45, softness:0.05, shading:0.55, jitter:0.05, holeColor:"#000000" },
+      "Light Board": { colors:"3", color1:"#8fbf3f", color2:"#c9d97a", color3:"#f5f0d8", speed:0.32, loopDuration:6.0, strength:3.80, density:1.30, brightness:1.25, colorMode:"gradient", ink:"#8fbf3f", paper:"#efebe0", cellSize:11, outer:0.82, inner:0.48, softness:0.04, shading:0.35, jitter:0.06, holeColor:"#f4f2ec" },
+      "Neon":     { colors:"3", color1:"#ff3d81", color2:"#5ce1e6", color3:"#faff5c", speed:0.45, loopDuration:5.0, strength:4.60, density:1.20, brightness:1.30, colorMode:"gradient", ink:"#ff3d81", paper:"#efebe0", cellSize:14, outer:0.88, inner:0.35, softness:0.05, shading:0.50, jitter:0.10, holeColor:"#0a0e14" },
+      "Mono":     { colors:"2", color1:"#1a1a1a", color2:"#1a1a1a", color3:"#ffffff", speed:0.30, loopDuration:6.0, strength:5.20, density:1.05, brightness:1.15, colorMode:"duotone", ink:"#1a1a1a", paper:"#efebe0", cellSize:12, outer:0.85, inner:0.45, softness:0.05, shading:0.35, jitter:0.04, holeColor:"#efebe0" }
+    }
+  },
+
   /* Generative but not gradient-derived — the only effect that draws nothing
      but two flat colours. It is in the Generative group because it needs no
      upload and it animates, not because it shares the gradient's pipeline. */
@@ -1851,13 +2078,15 @@ var EFFECTS = {
   }
 };
 
-var EFFECT_ORDER = ["gradient", "gdots", "gchars", "dissolve", "dither", "ascii"];
+var EFFECT_ORDER = ["gradient", "gdots", "gchars", "gbeads", "dissolve", "dither", "ascii"];
 
 /* Grouped so the panel states plainly which effects need an upload. `id` is
    the internal handle (stable across label renames — used as state map key);
-   `label` is the display string on the mode tab. */
+   `label` is the display string on the mode tab. Five Generative segments now
+   sit in the same row — each is flex:1 so the row stays one line and each
+   label just gets a bit narrower ("Beads" is 5 chars, plenty). */
 var EFFECT_GROUPS = [
-  { id: "generative", label: "Generative", ids: ["gradient", "gdots", "gchars", "dissolve"] },
+  { id: "generative", label: "Generative", ids: ["gradient", "gdots", "gchars", "gbeads", "dissolve"] },
   { id: "from-image", label: "From image", ids: ["dither", "ascii"] }
 ];
 
@@ -2999,7 +3228,9 @@ function syncMeta(){
 
 function syncStage(){
   var eff = currentEffect();
-  var useGL = (eff.id === "gradient");
+  /* Both Gradient and Beads render through GL programs on glCanvas; every
+     other effect paints to c2dCanvas. Keep this in sync with activeCanvas(). */
+  var useGL = (eff.id === "gradient" || eff.id === "gbeads");
 
   glCanvas.style.display = useGL ? "block" : "none";
   c2dCanvas.style.display = useGL ? "none" : "block";
@@ -3072,6 +3303,8 @@ function render(force){
     drawGradientDots(c2dCanvas, previewW, previewH, p, state.phase);
   } else if (eff.id === "gchars") {
     drawGradientChars(c2dCanvas, previewW, previewH, p, state.phase);
+  } else if (eff.id === "gbeads") {
+    drawGradientBeads(glCanvas, previewW, previewH, p, state.phase);
   } else if (eff.id === "dissolve") {
     drawDissolve(c2dCanvas, previewW, previewH, p, state.phase);
   } else if (eff.id === "dither") {
@@ -3082,9 +3315,11 @@ function render(force){
 }
 
 /* Whichever canvas is currently on screen — export and capture must follow
-   the active effect, not always the WebGL one. */
+   the active effect, not always the WebGL one. Gradient and Beads both render
+   through WebGL programs on glCanvas; everything else draws to c2dCanvas. */
 function activeCanvas(){
-  return currentEffect().id === "gradient" ? glCanvas : c2dCanvas;
+  var id = currentEffect().id;
+  return (id === "gradient" || id === "gbeads") ? glCanvas : c2dCanvas;
 }
 
 var rafId = 0;
@@ -3292,6 +3527,16 @@ function exportStill(){
       glCanvas.width = prevW;
       glCanvas.height = prevH;
       drawGradient(glCanvas, previewW, previewH, p, state.phase);
+    } else if (eff.id === "gbeads") {
+      /* Same save/restore as the gradient — both use GL programs on glCanvas. */
+      var prevBW = glCanvas.width, prevBH = glCanvas.height;
+      drawGradientBeads(glCanvas, d.w, d.h, p, state.phase);
+      out.width = d.w;
+      out.height = d.h;
+      out.getContext("2d").drawImage(glCanvas, 0, 0);
+      glCanvas.width = prevBW;
+      glCanvas.height = prevBH;
+      drawGradientBeads(glCanvas, previewW, previewH, p, state.phase);
     } else if (eff.id === "gdots") {
       drawGradientDots(out, d.w, d.h, p, state.phase);
     } else if (eff.id === "gchars") {
