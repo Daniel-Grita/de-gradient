@@ -152,6 +152,7 @@ that claim and needed no UI code, which settles it.
 | Gradient | WebGL, 4D simplex noise, three colours, grain |
 | Dots | The gradient rendered as an ordered-dither or halftone cell field |
 | Chars | The gradient rendered through a character ramp |
+| Beads | The gradient as a pegboard — one soft annulus per cell |
 | Dissolve | Two flat colours meeting at a band that breaks into square pixels |
 
 **From image** — needs an upload, static, Loop export disabled:
@@ -160,6 +161,15 @@ that claim and needed no UI code, which settles it.
 | --- | --- |
 | Dither | Ordered 2×2/4×4/8×8, Floyd–Steinberg, or halftone dots |
 | ASCII | Five character ramps |
+| Beads | The same pegboard, each bead the colour it sampled from the photo |
+
+**Beads appears in both families on purpose.** It is one mark with two sources,
+not two effects, so it keeps the same label, the same Beads controls in the same
+order, and the same preset names. Only the colour section differs: the
+generative one picks a palette, the image one picks between the photo's own
+colours and an ink-and-paper duotone, and gains the shared Tone section. Because
+the effect `<select>` only ever lists the current mode's effects, the two never
+sit in the same list — the mode tab above is what distinguishes them.
 
 Dots and Chars each offer a **colour mode**: ink-and-paper duotone, or the
 gradient's own colours posterised.
@@ -235,7 +245,7 @@ section beneath the switcher. Each effect holds its own parameter state, so
 returning to a previously-used effect restores what you left it at rather than
 resetting to defaults.
 
-**Loading a source image.** Dither and ASCII require an uploaded image. Until one
+**Loading a source image.** Every From-image effect requires an upload. Until one
 is provided, the canvas shows an empty state that reads as an invitation rather
 than an error. Drag-and-drop onto the canvas works as well as the file picker.
 
@@ -335,7 +345,7 @@ Two knock-on changes came with it:
 
 **"Export is a constant pair" — false.** Loop export is meaningless for a static
 image, so the Still/Loop pair is conditional on the active effect: Loop is
-disabled in Dither and ASCII, and Still is promoted to primary there. Export
+disabled in every From-image effect, and Still is promoted to primary there. Export
 state depends on effect state.
 
 ## Open Questions

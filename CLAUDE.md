@@ -59,8 +59,16 @@ Read `DESIGN_BRIEF.md` first. The short version:
 - **The loop is exact.** 4D simplex noise, two dimensions tracing a circle over
   the loop duration. Do not replace this with a cross-fade; the seamlessness of
   every exported loop depends on it.
-- **Generative effects** (Gradient, Dots, Chars, Dissolve) are animated and allow
-  Loop export. **Image effects** (Dither, ASCII) are static and disable it.
+- **Generative effects** (Gradient, Dots, Chars, Beads, Dissolve) are animated
+  and allow Loop export. **Image effects** (Dither, ASCII, Beads) are static and
+  disable it. **Beads exists in both families** — `gbeads` takes its colour from
+  the gradient, `ibeads` from an upload — and they deliberately share the label
+  "Beads", the control set and the preset names. The effect `<select>` only ever
+  lists one group, so the two never appear together. Keep them in step: a change
+  to the bead mark in one belongs in the other. `ibeads` is a per-pixel port of
+  `BEADS_FRAG_SRC`, not a canvas `arc()` per bead — softness, the hole and the
+  diagonal shading are sub-pixel work on the mask. Canvas y runs down where
+  `gl_FragCoord.y` runs up, so the shading vector is negated in the port.
 - **Dots and Chars sample the gradient at cell resolution**, not full resolution.
   Preserve that — averaging a full-size render down per frame is far too slow.
 - **Colour count is a control, not a constant.** Gradient/Dots/Chars take a

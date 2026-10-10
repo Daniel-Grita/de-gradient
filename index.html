@@ -1211,6 +1211,16 @@ function drawSourceCover(img, w, h){
   return workCtx.getImageData(0, 0, w, h);
 }
 
+/* The Tone section's curve, in one place: every From-image effect applies the
+   same brightness → contrast → gamma ramp, so the four sliders mean exactly
+   the same thing whichever of them you are using. */
+function toneCurve(v, p){
+  v = v * p.brightness;
+  v = (v - p.midpoint) * p.contrast + p.midpoint;
+  v = clamp(v, 0, 1);
+  return clamp(Math.pow(v, 1 / p.gamma), 0, 1);
+}
+
 /* Luminance grid at a given cell size, with tone controls applied. The cell
    count is derived per axis from one shared cell size, so cells stay square
    at every ratio — a stretched dither cell would read as a mistake. */
@@ -1235,12 +1245,7 @@ function luminanceGrid(imageData, w, h, cell, p){
         }
       }
       var lum = count ? (sum / count) / 255 : 0;
-
-      lum = lum * p.brightness;
-      lum = (lum - p.midpoint) * p.contrast + p.midpoint;
-      lum = clamp(lum, 0, 1);
-      lum = Math.pow(lum, 1 / p.gamma);
-      out[y * cols + x] = clamp(lum, 0, 1);
+      out[y * cols + x] = toneCurve(lum, p);
     }
   }
   return { grid: out, cols: cols, rows: rows, cw: cw, ch: ch };
@@ -1406,6 +1411,160 @@ function drawAscii(canvas, w, h, p, image){
       ctx.fillText(glyph, (x + 0.5) * cw, (y + 0.5) * ch);
     }
   }
+}
+
+/* ============================================================================
+   IMAGE BEADS RENDERER
+   The same pegboard as the generative Beads effect, with the bead colours
+   taken from an upload instead of from the gradient. It is a deliberate port
+   of BEADS_FRAG_SRC rather than a canvas arc() per bead: softness, the hole
+   and the diagonal shading are all sub-pixel work on the mask, and drawing
+   them with paths would need a separate composite pass per bead. Written per
+   pixel, the two effects produce the same mark for the same settings.
+   ============================================================================ */
+
+function smoothstep(e0, e1, x){
+  var t = clamp((x - e0) / (e1 - e0), 0, 1);
+  return t * t * (3 - 2 * t);
+}
+
+/* The GLSL hash21 from BEADS_FRAG_SRC, so jitter lands identically in both
+   effects. Deterministic per cell — never Math.random(), or the beads would
+   shift every time the panel re-rendered. */
+function beadHash(x, y){
+  var s = Math.sin(x * 127.1 + y * 311.7) * 43758.5453;
+  return s - Math.floor(s);
+}
+
+/* Per-cell average colour of the source, toned. Cells are a fixed square pitch
+   in pixels — a pegboard has holes at a fixed spacing, so the last column and
+   row run short rather than every cell stretching to make the count come out
+   even. */
+function colorCellGrid(imageData, w, h, cell, p){
+  var cols = Math.ceil(w / cell);
+  var rows = Math.ceil(h / cell);
+  var out = new Float32Array(cols * rows * 3);
+  var data = imageData.data;
+
+  for (var y = 0; y < rows; y++) {
+    var y0 = y * cell, y1 = Math.min(h, y0 + cell);
+    for (var x = 0; x < cols; x++) {
+      var x0 = x * cell, x1 = Math.min(w, x0 + cell);
+      var sr = 0, sg = 0, sb = 0, count = 0;
+      for (var sy = y0; sy < y1; sy++) {
+        var row = sy * w;
+        for (var sx = x0; sx < x1; sx++) {
+          var i = (row + sx) * 4;
+          sr += data[i]; sg += data[i+1]; sb += data[i+2];
+          count++;
+        }
+      }
+      var o = (y * cols + x) * 3;
+      if (!count) continue;
+      out[o]   = toneCurve(sr / count / 255, p);
+      out[o+1] = toneCurve(sg / count / 255, p);
+      out[o+2] = toneCurve(sb / count / 255, p);
+    }
+  }
+  return { cols: cols, rows: rows, rgb: out };
+}
+
+function drawImageBeads(canvas, w, h, p, image){
+  var ctx = canvas.getContext("2d");
+  if (canvas.width !== w || canvas.height !== h) {
+    canvas.width = w;
+    canvas.height = h;
+  }
+
+  var hole = hexToRgb255(p.holeColor);
+  ctx.fillStyle = p.holeColor;
+  ctx.fillRect(0, 0, w, h);
+  if (!image) return;
+
+  /* Cell size scales off the short edge exactly as Dither's pixel size and the
+     generative Beads' cell size do, so the bead covers the same fraction of
+     the frame in the preview as it does in the export. */
+  var cell = Math.max(2, Math.round(p.cellSize * (Math.min(w, h) / 680)));
+  var src = drawSourceCover(image, w, h);
+  var g = colorCellGrid(src, w, h, cell, p);
+  var cols = g.cols, rows = g.rows, rgb = g.rgb;
+
+  var duo = (p.colorMode === "duotone");
+  var ink = hexToRgb255(p.ink);
+  var paper = hexToRgb255(p.paper);
+
+  /* Everything constant across a cell is hoisted out of the pixel loop — the
+     bead's colour and its jittered centre. The hash is the expensive part, and
+     at export size the pixel loop runs millions of times. */
+  var bead = new Float32Array(cols * rows * 3);
+  var jx = new Float32Array(cols * rows);
+  var jy = new Float32Array(cols * rows);
+  var jAmt = p.jitter * cell * 0.6;
+
+  for (var cy = 0; cy < rows; cy++) {
+    for (var cx = 0; cx < cols; cx++) {
+      var ci = cy * cols + cx;
+      var co = ci * 3;
+      var r = rgb[co] * 255, gg = rgb[co+1] * 255, b = rgb[co+2] * 255;
+      if (duo) {
+        var lum = (0.2126 * r + 0.7152 * gg + 0.0722 * b) / 255;
+        r  = ink[0] + (paper[0] - ink[0]) * lum;
+        gg = ink[1] + (paper[1] - ink[1]) * lum;
+        b  = ink[2] + (paper[2] - ink[2]) * lum;
+      }
+      bead[co] = r; bead[co+1] = gg; bead[co+2] = b;
+      jx[ci] = (cx + 0.5) * cell + (beadHash(cx + 1.7, cy + 1.7) - 0.5) * jAmt;
+      jy[ci] = (cy + 0.5) * cell + (beadHash(cx + 37.3, cy + 37.3) - 0.5) * jAmt;
+    }
+  }
+
+  var out = ctx.createImageData(w, h);
+  var od = out.data;
+  var half = cell * 0.5;
+  var outerR = p.outer;
+  var innerR = p.inner * outerR;
+  var soft = Math.max(p.softness, 0.005);
+  var shading = p.shading;
+
+  for (var y = 0; y < h; y++) {
+    var cyi = Math.min(rows - 1, Math.floor(y / cell));
+    var py = y + 0.5;
+    for (var x = 0; x < w; x++) {
+      var cxi = Math.min(cols - 1, Math.floor(x / cell));
+      var idx = cyi * cols + cxi;
+      var dx = (x + 0.5 - jx[idx]) / half;
+      var dy = (py - jy[idx]) / half;
+      var dist = Math.sqrt(dx * dx + dy * dy);
+
+      var ring = (1 - smoothstep(outerR - soft, outerR + soft, dist)) *
+                 smoothstep(innerR - soft, innerR + soft, dist);
+
+      var i = (y * w + x) * 4;
+      od[i+3] = 255;
+      if (ring <= 0) {
+        od[i] = hole[0]; od[i+1] = hole[1]; od[i+2] = hole[2];
+        continue;
+      }
+
+      var o = idx * 3;
+      var br = bead[o], bg = bead[o+1], bb = bead[o+2];
+      if (shading > 0) {
+        /* Light from the top-left. Canvas y runs down where gl_FragCoord.y
+           runs up, so the shader's (-0.707, 0.707) becomes (-0.707, -0.707)
+           here — the same lit corner, not the opposite one. */
+        var shade = clamp(0.5 + 0.5 * (dx * -0.707 + dy * -0.707), 0, 1);
+        var lift = 0.7 + 0.55 * shade;
+        br += (br * lift - br) * shading;
+        bg += (bg * lift - bg) * shading;
+        bb += (bb * lift - bb) * shading;
+      }
+      od[i]   = hole[0] + (br - hole[0]) * ring;
+      od[i+1] = hole[1] + (bg - hole[1]) * ring;
+      od[i+2] = hole[2] + (bb - hole[2]) * ring;
+    }
+  }
+
+  ctx.putImageData(out, 0, 0);
 }
 
 /* ============================================================================
@@ -2000,6 +2159,7 @@ var EFFECTS = {
     label: "Dither",
     needsImage: true,
     animated: false,
+    dropVerb: "dither",
     defaults: {
       pattern: "8", pixelSize: 4, levels: 4, amount: 1.00,
       brightness: 1.36, contrast: 1.10, midpoint: 0.50, gamma: 1.00,
@@ -2042,6 +2202,7 @@ var EFFECTS = {
     label: "ASCII",
     needsImage: true,
     animated: false,
+    dropVerb: "convert",
     defaults: {
       charset: "classic", cellSize: 10,
       brightness: 1.25, contrast: 1.30, midpoint: 0.50, gamma: 1.00,
@@ -2075,10 +2236,70 @@ var EFFECTS = {
       "Newsprint":{ charset:"blocks", cellSize:8, brightness:1.30, contrast:1.20, midpoint:0.50, gamma:1.00, ink:"#ff5005", paper:"#efebe0" },
       "Sparse":   { charset:"minimal", cellSize:16, brightness:1.40, contrast:1.05, midpoint:0.55, gamma:1.20, ink:"#191d1a", paper:"#f4f2ec" }
     }
+  },
+
+  /* The generative Beads mark, fed from an upload. Same controls in the same
+     order as `gbeads` so the two read as one effect with two sources — only
+     the Color section differs, since there is no gradient palette to pick and
+     a Tone section instead. Static like the other From-image effects: no
+     Motion, and Loop export stays disabled. */
+  ibeads: {
+    id: "ibeads",
+    label: "Beads",
+    needsImage: true,
+    animated: false,
+    dropVerb: "bead",
+    defaults: {
+      cellSize: 12, outer: 0.85, inner: 0.42,
+      softness: 0.06, shading: 0.45, jitter: 0.08,
+      holeColor: "#0a0a0a",
+      colorMode: "image",
+      ink: "#ff5005", paper: "#efebe0",
+      brightness: 1.05, contrast: 1.10, midpoint: 0.50, gamma: 1.00
+    },
+    sections: [
+      { legend: "Source", controls: [ { type: "source" } ] },
+      { legend: "Beads", hint: "Cell size is the bead pitch; radius sets the outer edge; hole opens up the ring inside it.", controls: [
+        { type: "range", key: "cellSize", label: "Cell size", min: 4, max: 32, step: 1, dp: 0 },
+        { type: "range", key: "outer",    label: "Bead radius", min: 0.30, max: 1.00, step: 0.01, dp: 2 },
+        { type: "range", key: "inner",    label: "Hole radius", min: 0.00, max: 0.75, step: 0.01, dp: 2 },
+        { type: "range", key: "softness", label: "Softness",    min: 0.005, max: 0.30, step: 0.005, dp: 3 },
+        { type: "range", key: "shading",  label: "Shading",     min: 0.00, max: 1.00, step: 0.01, dp: 2 },
+        { type: "range", key: "jitter",   label: "Jitter",      min: 0.00, max: 0.50, step: 0.01, dp: 2 },
+        { type: "color", key: "holeColor", label: "Between beads" }
+      ]},
+      { legend: "Color", hint: "From photo keeps each bead the colour it sampled; ink & paper flattens the photo to two.", controls: [
+        { type: "select", key: "colorMode", label: "Color mode", options: [
+          { value: "image", label: "From photo" },
+          { value: "duotone", label: "Ink & paper" }
+        ]},
+        /* Gated, so the two swatches disappear in From-photo mode where they
+           do nothing. It also keeps Random off colorMode: randomiseCurrent
+           skips any select that something gates on, and flipping the mode on
+           every roll would throw the photo's own colour away half the time. */
+        { type: "color", key: "ink", label: "Ink",
+          activeWhen: { key: "colorMode", value: "duotone" } },
+        { type: "color", key: "paper", label: "Paper",
+          activeWhen: { key: "colorMode", value: "duotone" } }
+      ]},
+      { legend: "Tone", hint: "Midpoint sets where mid-grey lands; gamma redistributes the ramp between dark and light.", controls: [
+        { type: "range", key: "brightness", label: "Brightness", min: 0.2, max: 2, step: 0.01, dp: 2 },
+        { type: "range", key: "contrast", label: "Contrast", min: 0.2, max: 3, step: 0.01, dp: 2 },
+        { type: "range", key: "midpoint", label: "Midpoint", min: 0, max: 1, step: 0.01, dp: 2 },
+        { type: "range", key: "gamma", label: "Gamma", min: 0.2, max: 3, step: 0.01, dp: 2 }
+      ]}
+    ],
+    presets: {
+      "Pegboard":    { cellSize:12, outer:0.85, inner:0.42, softness:0.06, shading:0.45, jitter:0.08, holeColor:"#0a0a0a", colorMode:"image", ink:"#ff5005", paper:"#efebe0", brightness:1.05, contrast:1.10, midpoint:0.50, gamma:1.00 },
+      "Perler":      { cellSize:9,  outer:0.92, inner:0.46, softness:0.05, shading:0.55, jitter:0.05, holeColor:"#000000", colorMode:"image", ink:"#ff5005", paper:"#efebe0", brightness:1.10, contrast:1.25, midpoint:0.50, gamma:1.00 },
+      "Light Board": { cellSize:11, outer:0.82, inner:0.48, softness:0.04, shading:0.35, jitter:0.06, holeColor:"#f4f2ec", colorMode:"image", ink:"#8fbf3f", paper:"#efebe0", brightness:1.15, contrast:1.05, midpoint:0.52, gamma:1.10 },
+      "Solid":       { cellSize:14, outer:0.94, inner:0.00, softness:0.03, shading:0.60, jitter:0.00, holeColor:"#efebe0", colorMode:"image", ink:"#ff5005", paper:"#efebe0", brightness:1.00, contrast:1.20, midpoint:0.50, gamma:1.00 },
+      "Mono":        { cellSize:12, outer:0.85, inner:0.45, softness:0.05, shading:0.35, jitter:0.04, holeColor:"#efebe0", colorMode:"duotone", ink:"#191d1a", paper:"#efebe0", brightness:1.20, contrast:1.30, midpoint:0.50, gamma:1.00 }
+    }
   }
 };
 
-var EFFECT_ORDER = ["gradient", "gdots", "gchars", "gbeads", "dissolve", "dither", "ascii"];
+var EFFECT_ORDER = ["gradient", "gdots", "gchars", "gbeads", "dissolve", "dither", "ascii", "ibeads"];
 
 /* Grouped so the panel states plainly which effects need an upload. `id` is
    the internal handle (stable across label renames — used as state map key);
@@ -2087,7 +2308,7 @@ var EFFECT_ORDER = ["gradient", "gdots", "gchars", "gbeads", "dissolve", "dither
    label just gets a bit narrower ("Beads" is 5 chars, plenty). */
 var EFFECT_GROUPS = [
   { id: "generative", label: "Generative", ids: ["gradient", "gdots", "gchars", "gbeads", "dissolve"] },
-  { id: "from-image", label: "From image", ids: ["dither", "ascii"] }
+  { id: "from-image", label: "From image", ids: ["dither", "ascii", "ibeads"] }
 ];
 
 /* ============================================================================
@@ -3237,13 +3458,16 @@ function syncStage(){
 
   var needsDrop = eff.needsImage && !state.image;
   dropzone.classList.toggle("is-on", needsDrop);
-  el("dropzoneTitle").textContent = "Drop an image to " + (eff.id === "ascii" ? "convert" : "dither");
+  /* Verb comes off the effect rather than an id check here — a third From-image
+     effect made the ternary a lie, and the next one would too. */
+  var dropVerb = eff.dropVerb || eff.label.toLowerCase();
+  el("dropzoneTitle").textContent = "Drop an image to " + dropVerb;
 
   /* Name the artboard for assistive tech — a bare <canvas> is opaque to
      screen readers, so role="img" + aria-label on the wrapper is what
      announces "what am I looking at". */
-  var artboardLabel = eff.needsImage && !state.image
-    ? "Drop an image to " + eff.label.toLowerCase()
+  var artboardLabel = needsDrop
+    ? "Drop an image to " + dropVerb
     : eff.label + " — live preview";
   artboard.setAttribute("aria-label", artboardLabel);
 
@@ -3311,6 +3535,8 @@ function render(force){
     drawDither(c2dCanvas, previewW, previewH, p, state.image);
   } else if (eff.id === "ascii") {
     drawAscii(c2dCanvas, previewW, previewH, p, state.image);
+  } else if (eff.id === "ibeads") {
+    drawImageBeads(c2dCanvas, previewW, previewH, p, state.image);
   }
 }
 
@@ -3547,6 +3773,8 @@ function exportStill(){
       drawDither(out, d.w, d.h, p, state.image);
     } else if (eff.id === "ascii") {
       drawAscii(out, d.w, d.h, p, state.image);
+    } else if (eff.id === "ibeads") {
+      drawImageBeads(out, d.w, d.h, p, state.image);
     }
 
     var name = "degradient-" + eff.id + "-" + ratioSlug() + "-" + stamp() + ".png";

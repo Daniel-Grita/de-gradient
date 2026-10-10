@@ -10,10 +10,12 @@ moved from `.design/gritaflux-app/` to `.design/de-gradient-app/`.*
 
 `index.html` is 158 KB, single file, offline-genuine — three fonts embedded
 as base64 (Quantico 400 + 700, Nippo 700, all SIL OFL), zero external
-requests verified with the network killed. Six effects (Gradient, Dots,
-Chars, Dissolve, Dither, ASCII) in the variant-B two-level nav (mode tabs
-+ per-tab `<select>`). Export: PNG at delivery sizes (2048–4K) per ratio,
-MP4/webm loop at fixed 1080p equivalents per ratio.
+requests verified with the network killed. Eight effects in the variant-B
+two-level nav (mode tabs + per-tab `<select>`): Generative holds Gradient,
+Dots, Chars, Beads and Dissolve; From image holds Dither, ASCII and Beads.
+The two Beads share a label and a control set on purpose — one mark, two
+sources — and the mode tab is what tells them apart. Export: PNG at delivery
+sizes (2048–4K) per ratio, MP4/webm loop at fixed 1080p equivalents per ratio.
 
 Phase 7 landed 2026-09-01 → 2026-09-02 as batches 1–8 plus a review-gate
 pass and a small post-gate correction (hide-not-dim + Random button) and
@@ -204,13 +206,17 @@ not `.on`). `Target.attachToTarget` with `flatten:true`, then
    visible frame. `object-fit` is `contain` rather than `cover` and now only
    absorbs the sub-pixel rounding from keeping the buffer even-numbered.
 
-1. **Dither/ASCII on large images.** `luminanceGrid()` averages every source
-   pixel per cell, and `paintGrid()` then writes every output pixel. This is the
-   slowest path in the app and the 16:9 and 9:16 ratios export at 4K, roughly
-   double the pixels of the old square. Measured on the bundled Chromium:
-   Dither 107ms at 2048², 219ms at 3840×2160; ASCII 51ms / 93ms. Still a
-   one-off cost per still, but it is the first thing to feel slow if export
-   sizes grow again.
+1. **From-image effects on large images.** `luminanceGrid()` (or, for image
+   Beads, `colorCellGrid()`) averages every source pixel per cell, and the
+   paint pass then writes every output pixel. This is the slowest path in the
+   app and the 16:9 and 9:16 ratios export at 4K, roughly double the pixels of
+   the old square. Measured on the bundled Chromium, 2048² / 3840×2160:
+   Dither 107ms / 219ms; ASCII 51ms / 93ms; image Beads ~140ms / ~250ms.
+   Still a one-off cost per still, but it is the first thing to feel slow if
+   export sizes grow again. Image Beads is the one to watch: it is a per-pixel
+   port of the bead shader, so unlike Dither it cannot fall back to a cheap
+   scaled-up ImageData — softness, the hole and the shading are all sub-pixel
+   work on the mask.
 2. **Halftone in Dots** draws one arc per cell at full resolution every frame —
    much heavier than the block path, which scales a tiny ImageData up.
 3. ~~**Fonts are CDN-loaded**~~ **Resolved 2026-09-02** — both Quantico weights and
